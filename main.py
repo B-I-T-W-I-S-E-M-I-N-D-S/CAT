@@ -19,7 +19,6 @@ from loss_func import cls_loss_func, cls_loss_func_, regress_loss_func
 from loss_func import MultiCrossEntropyLoss
 from functools import *
 
-
 def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=opt['batch_size'], shuffle=True,
@@ -28,268 +27,131 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     epoch_cost_cls = 0
     epoch_cost_reg = 0
     epoch_cost_snip = 0
-   
+    #epoch_cost_sparsity = 0
 
 
     total_iter = len(train_dataset) // opt['batch_size']
     cls_loss = MultiCrossEntropyLoss(focal=True)
     snip_loss = MultiCrossEntropyLoss(focal=True)
-   
-    model.train()  # Ensure model is in training mode
+    #sparsity_lambda = 0.01  # Hyperparameter for sparsity loss
 
 
     for n_iter, (input_data, cls_label, reg_label, snip_label) in enumerate(tqdm(train_loader)):
-        # Warmup learning rate schedule
-        if warmup and n_iter < total_iter:
+        if warmup:
             for g in optimizer.param_groups:
-                g['lr'] = (n_iter + 1) * (opt['lr']) / total_iter
+                g['lr'] = n_iter * (opt['lr']) / total_iter
 
 
-        # Move data to GPU
-        input_data = input_data.float().cuda()
-        cls_label = cls_label.float().cuda()
-        reg_label = reg_label.float().cuda()
-        snip_label = snip_label.float().cuda()
+        act_cls, act_reg, snip_cls, attention_mask, history_metrics = model(input_data.float().cuda())
 
 
-        # Forward pass
-        try:
-            act_cls, act_reg, snip_cls, attention_mask, history_metrics = model(input_data)
-        except Exception as e:
-            print(f"Forward pass error: {e}")
-            continue
+        act_cls.register_hook(partial(cls_loss.collect_grad, cls_label))
+        snip_cls.register_hook(partial(snip_loss.collect_grad, snip_label))
 
 
-        # Check for NaN in model outputs
-        if torch.isnan(act_cls).any() or torch.isnan(act_reg).any() or torch.isnan(snip_cls).any():
-            print("NaN detected in model outputs, skipping batch")
-            continue
+        cost_reg = 0
+        cost_cls = 0
+        #cost_sparsity = 0
 
 
-        # Register hooks for gradient collection (only if gradients exist)
-        if act_cls.requires_grad:
-            act_cls.register_hook(partial(cls_loss.collect_grad, cls_label))
-        if snip_cls.requires_grad:
-            snip_cls.register_hook(partial(snip_loss.collect_grad, snip_label))
+        loss = cls_loss_func_(cls_loss, cls_label, act_cls)
+        cost_cls = loss
+        epoch_cost_cls += cost_cls.detach().cpu().numpy()
 
 
-        # Initialize costs
-        cost_reg = torch.tensor(0.0).cuda()
-        cost_cls = torch.tensor(0.0).cuda()
-        cost_snip = torch.tensor(0.0).cuda()
+        loss = regress_loss_func(reg_label, act_reg)
+        cost_reg = loss
+        epoch_cost_reg += cost_reg.detach().cpu().numpy()
 
 
-        # Classification loss
-        try:
-            cost_cls = cls_loss_func_(cls_loss, cls_label, act_cls)
-            if torch.isnan(cost_cls) or torch.isinf(cost_cls):
-                cost_cls = torch.tensor(0.0).cuda()
-        except Exception as e:
-            print(f"Classification loss error: {e}")
-            cost_cls = torch.tensor(0.0).cuda()
+        loss = cls_loss_func_(snip_loss, snip_label, snip_cls)
+        cost_snip = loss
+        epoch_cost_snip += cost_snip.detach().cpu().numpy()
 
 
-        # Regression loss
-        try:
-            cost_reg = regress_loss_func(reg_label, act_reg)
-            if torch.isnan(cost_reg) or torch.isinf(cost_reg):
-                cost_reg = torch.tensor(0.0).cuda()
-        except Exception as e:
-            print(f"Regression loss error: {e}")
-            cost_reg = torch.tensor(0.0).cuda()
+        # Sparsity loss: Encourage sparse attention weights
+        # cost_sparsity = torch.mean(torch.abs(attention_mask))  # L1 regularization
+        # epoch_cost_sparsity += cost_sparsity.detach().cpu().numpy()
 
 
-        # Snippet loss
-        try:
-            cost_snip = cls_loss_func_(snip_loss, snip_label, snip_cls)
-            if torch.isnan(cost_snip) or torch.isinf(cost_snip):
-                cost_snip = torch.tensor(0.0).cuda()
-        except Exception as e:
-            print(f"Snippet loss error: {e}")
-            cost_snip = torch.tensor(0.0).cuda()
+        cost = opt['alpha'] * cost_cls + opt['beta'] * cost_reg + opt['gamma'] * cost_snip 
 
 
-        # Total loss with proper weighting
-        alpha = opt.get('alpha', 1.0)
-        beta = opt.get('beta', 1.0)
-        gamma = opt.get('gamma', 1.0)
-       
-        cost = alpha * cost_cls + beta * cost_reg + gamma * cost_snip
+        epoch_cost += cost.detach().cpu().numpy()
 
 
-        # Check for valid total cost
-        if torch.isnan(cost) or torch.isinf(cost) or cost <= 0:
-            print(f"Invalid total cost: {cost}, skipping batch")
-            continue
-
-
-        # Accumulate epoch costs
-        epoch_cost += cost.detach().cpu().item()
-        epoch_cost_cls += cost_cls.detach().cpu().item()
-        epoch_cost_reg += cost_reg.detach().cpu().item()
-        epoch_cost_snip += cost_snip.detach().cpu().item()
-
-
-        # Backward pass with gradient clipping
         optimizer.zero_grad()
-       
-        try:
-            cost.backward()
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        except Exception as e:
-            print(f"Backward pass error: {e}")
-            optimizer.zero_grad()
-            continue
-
-
-        # Print progress every 100 iterations
-        if n_iter % 100 == 0:
-            print(f"Iter {n_iter}/{total_iter}: Total={cost.item():.4f}, "
-                  f"Cls={cost_cls.item():.4f}, Reg={cost_reg.item():.4f}, "
-                  f"Snip={cost_snip.item():.4f}")
+        cost.backward()
+        optimizer.step()
 
 
     return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip
 
 
-
-
 def eval_one_epoch(opt, model, test_dataset):
-    model.eval()  # Set model to evaluation mode
+    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model,test_dataset)
+       
+    result_dict = eval_map_nms(opt,test_dataset, output_cls, output_reg, labels_cls, labels_reg)
+    output_dict={"version":"VERSION 1.3","results":result_dict,"external_data":{}}
+    outfile=open(opt["result_file"].format(opt['exp']),"w")
+    json.dump(output_dict,outfile, indent=2)
+    outfile.close()
    
-    with torch.no_grad():  # Disable gradient computation for evaluation
-        cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, test_dataset)
-   
-    # Check if outputs are valid
-    if not output_cls or not output_reg:
-        print("Warning: Empty outputs from eval_frame")
-        return 0.0, 0.0, 0.0, 0.0
-   
-    try:
-        result_dict = eval_map_nms(opt, test_dataset, output_cls, output_reg, labels_cls, labels_reg)
-       
-        # Save results
-        output_dict = {"version": "VERSION 1.3", "results": result_dict, "external_data": {}}
-        result_file = opt["result_file"].format(opt['exp'])
-       
-        with open(result_file, "w") as outfile:
-            json.dump(output_dict, outfile, indent=2)
-       
-        # Evaluate detection performance
-        IoUmAP = evaluation_detection(opt, verbose=False)
-       
-        if IoUmAP is not None and len(IoUmAP) > 0:
-            IoUmAP_5 = sum(IoUmAP[0:]) / len(IoUmAP[0:])
-        else:
-            print("Warning: evaluation_detection returned empty results")
-            IoUmAP_5 = 0.0
-           
-    except Exception as e:
-        print(f"Evaluation error: {e}")
-        IoUmAP_5 = 0.0
+    IoUmAP = evaluation_detection(opt, verbose=False)
+    IoUmAP_5=sum(IoUmAP[0:])/len(IoUmAP[0:])
 
 
     return cls_loss, reg_loss, tot_loss, IoUmAP_5
 
 
-
-
+   
 def train(opt):
     writer = SummaryWriter()
     model = MYNET(opt).cuda()
    
-    # Initialize best_map attribute
-    if not hasattr(model, 'best_map'):
-        model.best_map = 0.0
-   
-    # Separate parameters for different learning rates
     rest_of_model_params = [param for name, param in model.named_parameters() if "history_unit" not in name]
  
-    # Optimizer with different learning rates
-    optimizer = optim.Adam([
-        {'params': model.history_unit.parameters(), 'lr': 1e-6},
-        {'params': rest_of_model_params, 'lr': opt["lr"]}
-    ], weight_decay=opt["weight_decay"])
+    optimizer = optim.Adam([{'params': model.history_unit.parameters(), 'lr': 1e-6}, {'params': rest_of_model_params}],lr=opt["lr"],weight_decay = opt["weight_decay"])  
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size = opt["lr_step"])
    
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=opt["lr_step"])
+    train_dataset = VideoDataSet(opt,subset="train")      
+    test_dataset = VideoDataSet(opt,subset=opt['inference_subset'])
    
-    # Datasets
-    train_dataset = VideoDataSet(opt, subset="train")      
-    test_dataset = VideoDataSet(opt, subset=opt['inference_subset'])
-   
-    print(f"Training dataset size: {len(train_dataset)}")
-    print(f"Test dataset size: {len(test_dataset)}")
-   
-    warmup = True  # Enable warmup for first epoch
+    warmup=False
    
     for n_epoch in range(opt['epoch']):  
-        print(f"\n=== Epoch {n_epoch + 1}/{opt['epoch']} ===")
+        if n_epoch >=1:
+            warmup=False
        
-        # Disable warmup after first epoch
-        if n_epoch >= 1:
-            warmup = False
-       
-        # Training
-        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip = train_one_epoch(
-            opt, model, train_dataset, optimizer, warmup)
-       
-        # Check for valid training costs
-        if n_iter == 0:
-            print("Warning: No training iterations completed")
-            continue
+        n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip = train_one_epoch(opt, model, train_dataset, optimizer, warmup)
            
-        avg_cost = epoch_cost / (n_iter + 1)
-        avg_cls = epoch_cost_cls / (n_iter + 1)
-        avg_reg = epoch_cost_reg / (n_iter + 1)
-        avg_snip = epoch_cost_snip / (n_iter + 1)
+        writer.add_scalars('data/cost', {'train': epoch_cost/(n_iter+1)}, n_epoch)
+        print("training loss(epoch %d): %.03f, cls - %f, reg - %f, snip - %f, lr - %f"%(n_epoch,
+                                                                            epoch_cost/(n_iter+1),
+                                                                            epoch_cost_cls/(n_iter+1),
+                                                                            epoch_cost_reg/(n_iter+1),
+                                                                            epoch_cost_snip/(n_iter+1),
+                                                                            optimizer.param_groups[-1]["lr"]) )
        
-        # Log training metrics
-        writer.add_scalars('data/cost', {'train': avg_cost}, n_epoch)
-       
-        print(f"Training loss(epoch {n_epoch}): {avg_cost:.4f}, "
-              f"cls - {avg_cls:.4f}, reg - {avg_reg:.4f}, snip - {avg_snip:.4f}, "
-              f"lr - {optimizer.param_groups[-1]['lr']:.6f}")
-       
-        # Learning rate scheduling
         scheduler.step()
+        model.eval()
        
-        # Evaluation
-        cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(opt, model, test_dataset)
+        cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(opt, model,test_dataset)
        
-        # Log evaluation metrics
         writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
-       
-        print(f"Testing loss(epoch {n_epoch}): {tot_loss:.4f}, "
-              f"cls - {cls_loss:.4f}, reg - {reg_loss:.4f}, mAP Avg - {IoUmAP_5:.4f}")
+        print("testing loss(epoch %d): %.03f, cls - %f, reg - %f, mAP Avg - %f"%(n_epoch,tot_loss, cls_loss, reg_loss, IoUmAP_5))
                    
-        # Save checkpoint
-        state = {
-            'epoch': n_epoch + 1,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'best_map': model.best_map
-        }
-       
-        checkpoint_path = f"{opt['checkpoint_path']}/{opt['exp']}_checkpoint_{n_epoch+1}.pth.tar"
-        torch.save(state, checkpoint_path)
-       
-        # Save best model
+        state = {'epoch': n_epoch + 1,
+                    'state_dict': model.state_dict()}
+        torch.save(state, opt["checkpoint_path"]+"/"+opt["exp"]+"_checkpoint_"+str(n_epoch+1)+".pth.tar" )
         if IoUmAP_5 > model.best_map:
             model.best_map = IoUmAP_5
-            best_path = f"{opt['checkpoint_path']}/{opt['exp']}_ckp_best.pth.tar"
-            torch.save(state, best_path)
-            print(f"New best mAP: {IoUmAP_5:.4f}")
+            torch.save(state, opt["checkpoint_path"]+"/"+opt["exp"]+"_ckp_best.pth.tar" )
            
-        # Set model back to training mode
         model.train()
-   
+               
     writer.close()
-    print(f"\nTraining completed. Best mAP: {model.best_map:.4f}")
     return model.best_map
-
-
 
 
 def eval_frame(opt, model, dataset):
@@ -297,12 +159,10 @@ def eval_frame(opt, model, dataset):
                                               batch_size=opt['batch_size'], shuffle=False,
                                               num_workers=0, pin_memory=True, drop_last=False)
    
-    # Initialize output dictionaries
     labels_cls = {}
     labels_reg = {}
     output_cls = {}
-    output_reg = {}
-   
+    output_reg = {}                                      
     for video_name in dataset.video_list:
         labels_cls[video_name] = []
         labels_reg[video_name] = []
@@ -313,99 +173,50 @@ def eval_frame(opt, model, dataset):
     total_frames = 0  
     epoch_cost = 0
     epoch_cost_cls = 0
-    epoch_cost_reg = 0
+    epoch_cost_reg = 0  
    
-    model.eval()
-   
-    with torch.no_grad():
-        for n_iter, (input_data, cls_label, reg_label, _) in enumerate(tqdm(test_loader)):
-            try:
-                # Move to GPU
-                input_data = input_data.float().cuda()
-                cls_label = cls_label.float().cuda()
-                reg_label = reg_label.float().cuda()
+    for n_iter, (input_data, cls_label, reg_label, _) in enumerate(tqdm(test_loader)):
+        act_cls, act_reg, _, _, _ = model(input_data.float().cuda())  # Ignore snip_cls, attention_mask, and history_metrics
+        cost_reg = 0
+        cost_cls = 0
+       
+        loss = cls_loss_func(cls_label, act_cls)
+        cost_cls = loss
+        epoch_cost_cls += cost_cls.detach().cpu().numpy()    
                
-                # Forward pass
-                act_cls, act_reg, _, _, _ = model(input_data)
+        loss = regress_loss_func(reg_label, act_reg)
+        cost_reg = loss  
+        epoch_cost_reg += cost_reg.detach().cpu().numpy()  
+       
+        cost = opt['alpha'] * cost_cls + opt['beta'] * cost_reg    
                
-                # Check for NaN outputs
-                if torch.isnan(act_cls).any() or torch.isnan(act_reg).any():
-                    print(f"NaN detected in evaluation at iteration {n_iter}")
-                    continue
-               
-                # Compute losses for monitoring
-                try:
-                    cost_cls = cls_loss_func(cls_label, act_cls)
-                    cost_reg = regress_loss_func(reg_label, act_reg)
-                   
-                    if not torch.isnan(cost_cls):
-                        epoch_cost_cls += cost_cls.item()
-                    if not torch.isnan(cost_reg):
-                        epoch_cost_reg += cost_reg.item()
-                       
-                    cost = opt.get('alpha', 1.0) * cost_cls + opt.get('beta', 1.0) * cost_reg
-                    if not torch.isnan(cost):
-                        epoch_cost += cost.item()
-                       
-                except Exception as e:
-                    print(f"Loss computation error in evaluation: {e}")
-                    continue
-               
-                # Apply softmax to classification outputs
-                act_cls = torch.softmax(act_cls, dim=-1)
-               
-                # Move to CPU for processing
-                act_cls_cpu = act_cls.detach().cpu().numpy()
-                act_reg_cpu = act_reg.detach().cpu().numpy()
-                cls_label_cpu = cls_label.detach().cpu().numpy()
-                reg_label_cpu = reg_label.detach().cpu().numpy()
-               
-                total_frames += input_data.size(0)
-               
-                # Store results for each sample in batch
-                for b in range(input_data.size(0)):
-                    try:
-                        video_name, st, ed, data_idx = dataset.inputs[n_iter * opt['batch_size'] + b]
-                       
-                        output_cls[video_name].append(act_cls_cpu[b, :])
-                        output_reg[video_name].append(act_reg_cpu[b, :])
-                        labels_cls[video_name].append(cls_label_cpu[b, :])
-                        labels_reg[video_name].append(reg_label_cpu[b, :])
-                       
-                    except IndexError as e:
-                        print(f"Index error in evaluation: {e}")
-                        break
-                       
-            except Exception as e:
-                print(f"Evaluation iteration error: {e}")
-                continue
+        epoch_cost += cost.detach().cpu().numpy()
+       
+        act_cls = torch.softmax(act_cls, dim=-1)
+       
+        total_frames += input_data.size(0)
+       
+        for b in range(0, input_data.size(0)):
+            video_name, st, ed, data_idx = dataset.inputs[n_iter * opt['batch_size'] + b]
+            output_cls[video_name] += [act_cls[b, :].detach().cpu().numpy()]
+            output_reg[video_name] += [act_reg[b, :].detach().cpu().numpy()]
+            labels_cls[video_name] += [cls_label[b, :].numpy()]
+            labels_reg[video_name] += [reg_label[b, :].numpy()]
        
     end_time = time.time()
     working_time = end_time - start_time
    
-    # Convert lists to numpy arrays
     for video_name in dataset.video_list:
-        if len(labels_cls[video_name]) > 0:
-            labels_cls[video_name] = np.stack(labels_cls[video_name], axis=0)
-            labels_reg[video_name] = np.stack(labels_reg[video_name], axis=0)
-            output_cls[video_name] = np.stack(output_cls[video_name], axis=0)
-            output_reg[video_name] = np.stack(output_reg[video_name], axis=0)
-        else:
-            print(f"Warning: No valid data for video {video_name}")
+        labels_cls[video_name] = np.stack(labels_cls[video_name], axis=0)
+        labels_reg[video_name] = np.stack(labels_reg[video_name], axis=0)
+        output_cls[video_name] = np.stack(output_cls[video_name], axis=0)
+        output_reg[video_name] = np.stack(output_reg[video_name], axis=0)
    
-    # Compute average losses
-    if n_iter > 0:
-        cls_loss = epoch_cost_cls / (n_iter + 1)
-        reg_loss = epoch_cost_reg / (n_iter + 1)
-        tot_loss = epoch_cost / (n_iter + 1)
-    else:
-        cls_loss = reg_loss = tot_loss = 0.0
+    cls_loss = epoch_cost_cls / n_iter
+    reg_loss = epoch_cost_reg / n_iter
+    tot_loss = epoch_cost / n_iter
      
     return cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames
-
-
-
-
 
 
 
@@ -456,10 +267,6 @@ def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
         proposal_dict=[]
        
     return result_dict
-
-
-
-
 
 
 
@@ -534,8 +341,6 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
     return result_dict
 
 
-
-
  
 def test_frame(opt):
     model = MYNET(opt).cuda()
@@ -573,25 +378,15 @@ def patch_attention(m):
     forward_orig = m.forward
 
 
-
-
     def wrap(*args, **kwargs):
         kwargs["need_weights"] = True
         kwargs["average_attn_weights"] = False
 
 
-
-
         return forward_orig(*args, **kwargs)
 
 
-
-
     m.forward = wrap
-
-
-
-
 
 
 
@@ -601,18 +396,12 @@ class SaveOutput:
         self.outputs = []
 
 
-
-
     def __call__(self, module, module_in, module_out):
         self.outputs.append(module_out[1])
 
 
-
-
     def clear(self):
         self.outputs = []
-
-
 
 
 def test(opt):
@@ -636,8 +425,6 @@ def test(opt):
     outfile.close()
    
     mAP = evaluation_detection(opt)
-
-
 
 
 def test_online(opt):
@@ -745,10 +532,6 @@ def test_online(opt):
 
 
 
-
-
-
-
 def main(opt):
     max_perf=0
     if opt['mode'] == 'train':
@@ -763,8 +546,6 @@ def main(opt):
         evaluation_detection(opt)
        
     return max_perf
-
-
 
 
 if __name__ == '__main__':
